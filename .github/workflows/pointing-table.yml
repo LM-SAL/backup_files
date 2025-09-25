@@ -1,0 +1,73 @@
+name: Get and Update Pointing Table
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  run-and-commit:
+    runs-on: ubuntu-latest
+    env:
+      PY_SCRIPT: get_pointing_table.py
+      OUTPUT_DIR: generated
+      TARGET_BRANCH: aia
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - name: Run the script
+        run: python "$PY_SCRIPT"
+      - name: Commit generated output to ${{ env.TARGET_BRANCH }}
+        run: |
+          set -euo pipefail
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git fetch --all --prune
+
+          # Create a temporary worktree checked out at TARGET_BRANCH
+          TMP_DIR="$(mktemp -d)"
+          if git ls-remote --exit-code --heads origin "$TARGET_BRANCH" > /dev/null 2>&1; then
+            # Branch exists on remote: create/reset a local branch to that ref
+            git worktree add --checkout -B "$TARGET_BRANCH" "$TMP_DIR" "origin/$TARGET_BRANCH"
+          else
+            # Branch doesn't exist: base it on current main HEAD
+            git worktree add --checkout -B "$TARGET_BRANCH" "$TMP_DIR"
+          fi
+
+          # Sync just the generated files into the worktree
+          mkdir -p "$TMP_DIR/$OUTPUT_DIR"
+          rsync -a --delete "$OUTPUT_DIR"/ "$TMP_DIR/$OUTPUT_DIR"/ || true
+
+          # Commit & push from the worktree
+          cd "$TMP_DIR"
+          git add -A "$OUTPUT_DIR"
+
+          if git diff --staged --quiet; then
+            echo "No changes to commit on $TARGET_BRANCH."
+            exit 0
+          fi
+
+          git commit -m "chore: update generated files [skip ci]"
+          git push origin "$TARGET_BRANCH"
+
+          # Clean up the extra checkout
+          cd -
+          git worktree remove "$TMP_DIR" --force
