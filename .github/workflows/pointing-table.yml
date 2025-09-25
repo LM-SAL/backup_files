@@ -1,0 +1,97 @@
+name: Get and Update Pointing Table
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'  # Everyday at midnight UTC
+
+permissions:
+  contents: write
+
+jobs:
+  run-and-commit:
+    runs-on: ubuntu-latest
+    env:
+      PY_SCRIPT: get_pointing_table.py
+      OUTPUT_DIR: generated
+      TARGET_BRANCH: aia
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - name: Run the script
+        run: python "$PY_SCRIPT"
+      - name: Publish generated output(s)
+        shell: bash
+        env:
+          PUBLISH_DIR: ${{ env.OUTPUT_DIR }}
+          OUTPUT_DIR: ${{ env.OUTPUT_DIR }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -d "$OUTPUT_DIR" ]; then
+            echo "::warning::Output dir '$OUTPUT_DIR' not found; nothing to publish."
+            exit 0
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global --add safe.directory '*'
+
+          git fetch origin "$TARGET_BRANCH" || true
+          WORKTREE_DIR="$(mktemp -d)"
+
+          if git ls-remote --exit-code --heads origin "$TARGET_BRANCH" >/dev/null 2>&1; then
+            git worktree add --checkout -B "$TARGET_BRANCH" "$WORKTREE_DIR" "origin/$TARGET_BRANCH"
+          else
+            git worktree add --detach "$WORKTREE_DIR"
+            (
+              cd "$WORKTREE_DIR"
+              git switch --orphan "$TARGET_BRANCH"
+              echo "initialized" > .gitkeep
+              git add .gitkeep
+              git commit -m "chore: initialize $TARGET_BRANCH [skip ci]"
+              git push -u origin "$TARGET_BRANCH"
+            )
+            git worktree remove "$WORKTREE_DIR" --force
+            WORKTREE_DIR="$(mktemp -d)"
+            git worktree add --checkout -B "$TARGET_BRANCH" "$WORKTREE_DIR" "origin/$TARGET_BRANCH"
+          fi
+
+          find "$WORKTREE_DIR" -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
+
+          DEST="$WORKTREE_DIR/$PUBLISH_DIR"
+          mkdir -p "$DEST"
+          rsync -a --delete --exclude '.git' "$OUTPUT_DIR"/ "$DEST"/
+
+          if [ -z "$(ls -A "$WORKTREE_DIR" | grep -v '^.git$')" ]; then
+            echo "::warning::No files produced in $OUTPUT_DIR; skipping commit."
+            exit 0
+          fi
+
+          cd "$WORKTREE_DIR"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "No changes to publish."
+            exit 0
+          fi
+          SHORT_SHA="$(echo "${GITHUB_SHA:-}" | cut -c1-7)"
+          git commit -m "chore: publish generated output from ${SHORT_SHA} [skip ci]"
+          git push origin "$TARGET_BRANCH"
+
+          cd -
+          git worktree remove "$WORKTREE_DIR" --force
